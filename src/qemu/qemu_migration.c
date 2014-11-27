@@ -2075,6 +2075,11 @@ qemuMigrationUpdateJobStatus(virQEMUDriverPtr driver,
         ret = 0;
         break;
 
+    case QEMU_MONITOR_MIGRATION_STATUS_POSTCOPY_ACTIVE:
+        jobInfo->type = VIR_DOMAIN_JOB_BOUNDED;
+        ret = 0;
+        break;
+
     case QEMU_MONITOR_MIGRATION_STATUS_INACTIVE:
         jobInfo->type = VIR_DOMAIN_JOB_NONE;
         virReportError(VIR_ERR_OPERATION_FAILED,
@@ -2107,7 +2112,8 @@ qemuMigrationWaitForCompletion(virQEMUDriverPtr driver,
                                virDomainObjPtr vm,
                                qemuDomainAsyncJob asyncJob,
                                virConnectPtr dconn,
-                               bool abort_on_error)
+                               bool abort_on_error,
+                               bool exit_on_postcopy_active)
 {
     qemuDomainObjPrivatePtr priv = vm->privateData;
     qemuDomainJobInfoPtr jobInfo = priv->job.current;
@@ -2130,7 +2136,9 @@ qemuMigrationWaitForCompletion(virQEMUDriverPtr driver,
 
     jobInfo->type = VIR_DOMAIN_JOB_UNBOUNDED;
 
-    while (jobInfo->type == VIR_DOMAIN_JOB_UNBOUNDED) {
+    while (jobInfo->type == VIR_DOMAIN_JOB_UNBOUNDED ||
+           (!exit_on_postcopy_active &&
+            jobInfo->type == VIR_DOMAIN_JOB_BOUNDED)) {
         /* Poll every 50ms for progress & to allow cancellation */
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000ull };
 
@@ -2159,7 +2167,8 @@ qemuMigrationWaitForCompletion(virQEMUDriverPtr driver,
         virObjectLock(vm);
     }
 
-    if (jobInfo->type == VIR_DOMAIN_JOB_COMPLETED) {
+    if (jobInfo->type == VIR_DOMAIN_JOB_COMPLETED ||
+        jobInfo->type == VIR_DOMAIN_JOB_BOUNDED) {
         qemuDomainJobInfoUpdateDowntime(jobInfo);
         VIR_FREE(priv->job.completed);
         if (VIR_ALLOC(priv->job.completed) == 0)
@@ -3191,6 +3200,18 @@ qemuMigrationConfirmPhase(virQEMUDriverPtr driver,
 
     virCheckFlags(QEMU_MIGRATION_FLAGS, -1);
 
+    /* Wait for post-copy to complete */
+    if (flags & VIR_MIGRATE_ENABLE_POSTCOPY) {
+        bool abort_on_error = !!(flags & VIR_MIGRATE_ABORT_ON_ERROR);
+        bool exit_on_postcopy_active = false;
+        rv = qemuMigrationWaitForCompletion(driver, vm,
+                                            QEMU_ASYNC_JOB_MIGRATION_OUT,
+                                            conn, abort_on_error,
+                                            exit_on_postcopy_active);
+        if (rv < 0)
+            goto cleanup;
+    }
+
     qemuMigrationJobSetPhase(driver, vm,
                              retcode == 0
                              ? QEMU_MIGRATION_PHASE_CONFIRM3
@@ -3788,9 +3809,14 @@ qemuMigrationRun(virQEMUDriverPtr driver,
         !(iothread = qemuMigrationStartTunnel(spec->fwd.stream, fd)))
         goto cancel;
 
-    rc = qemuMigrationWaitForCompletion(driver, vm,
-                                        QEMU_ASYNC_JOB_MIGRATION_OUT,
-                                        dconn, abort_on_error);
+    {
+        bool exit_on_postcopy_active = true;
+        rc = qemuMigrationWaitForCompletion(driver, vm,
+                                            QEMU_ASYNC_JOB_MIGRATION_OUT,
+                                            dconn, abort_on_error,
+                                            exit_on_postcopy_active);
+    }
+
     if (rc == -2)
         goto cancel;
     else if (rc == -1)
@@ -5258,7 +5284,13 @@ qemuMigrationToFile(virQEMUDriverPtr driver, virDomainObjPtr vm,
     if (rc < 0)
         goto cleanup;
 
-    rc = qemuMigrationWaitForCompletion(driver, vm, asyncJob, NULL, false);
+    {
+        bool abort_on_error = false;
+        bool exit_on_postcopy_active = true;
+        rc = qemuMigrationWaitForCompletion(driver, vm, asyncJob, NULL,
+                                            abort_on_error,
+                                            exit_on_postcopy_active);
+    }
 
     if (rc < 0) {
         if (rc == -2) {
