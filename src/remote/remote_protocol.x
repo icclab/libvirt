@@ -3143,6 +3143,10 @@ struct remote_domain_get_fsinfo_ret {
     unsigned int ret;
 };
 
+struct remote_domain_migrate_start_post_copy_args {
+    remote_nonnull_domain dom;
+    unsigned int flags;
+};
 /*----- Protocol. -----*/
 
 /* Define the program number, protocol version and procedure numbers here. */
@@ -5550,5 +5554,11 @@ enum remote_procedure {
      * @generate: none
      * @acl: domain:fs_freeze
      */
-    REMOTE_PROC_DOMAIN_GET_FSINFO = 349
+    REMOTE_PROC_DOMAIN_GET_FSINFO = 349,
+
+    /**
+     * @generate: both
+     * @acl: domain:migrate
+     */
+    REMOTE_PROC_DOMAIN_MIGRATE_START_POST_COPY = 350
 };
