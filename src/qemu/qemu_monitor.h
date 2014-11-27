@@ -452,6 +452,7 @@ enum {
     QEMU_MONITOR_MIGRATION_STATUS_ERROR,
     QEMU_MONITOR_MIGRATION_STATUS_CANCELLED,
     QEMU_MONITOR_MIGRATION_STATUS_SETUP,
+    QEMU_MONITOR_MIGRATION_STATUS_POSTCOPY_ACTIVE,
 
     QEMU_MONITOR_MIGRATION_STATUS_LAST
 };
@@ -505,6 +506,7 @@ typedef enum {
     QEMU_MONITOR_MIGRATION_CAPS_XBZRLE,
     QEMU_MONITOR_MIGRATION_CAPS_AUTO_CONVERGE,
     QEMU_MONITOR_MIGRATION_CAPS_RDMA_PIN_ALL,
+    QEMU_MONITOR_MIGRATION_CAPS_POSTCOPY,
 
     QEMU_MONITOR_MIGRATION_CAPS_LAST
 } qemuMonitorMigrationCaps;
@@ -560,6 +562,8 @@ int qemuMonitorMigrateToFile(qemuMonitorPtr mon,
 int qemuMonitorMigrateToUnix(qemuMonitorPtr mon,
                              unsigned int flags,
                              const char *unixfile);
+
+int qemuMonitorMigrateStartPostCopy(qemuMonitorPtr mon);
 
 int qemuMonitorMigrateCancel(qemuMonitorPtr mon);
 
