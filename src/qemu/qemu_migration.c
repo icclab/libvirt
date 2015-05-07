@@ -2825,9 +2825,12 @@ qemuMigrationPrepareAny(virQEMUDriverPtr driver,
         goto done;
 
     if (tunnel &&
-        (pipe(dataFD) < 0 || virSetCloseExec(dataFD[1]) < 0)) {
-        virReportSystemError(errno, "%s",
-                             _("cannot create pipe for tunnelled migration"));
+                (socketpair(AF_UNIX, SOCK_STREAM, 0, dataFD) < 0 ||
+                virSetBlocking(dataFD[0], false) < 0 ||
+                virSetBlocking(dataFD[1], false) < 0 ||
+                virSetCloseExec(dataFD[0]) < 0  ||
+                virSetCloseExec(dataFD[1]) < 0)) {
+                virReportSystemError(errno, "%s", _("cannot create socket pair for tunnelled migration"));
         goto endjob;
     }
 
@@ -3409,176 +3412,224 @@ struct _qemuMigrationSpec {
 };
 
 #define TUNNEL_SEND_BUF_SIZE 65536
+#define TUNNEL_RECV_BUF_SIZE 1024
 
-typedef struct _qemuMigrationIOThread qemuMigrationIOThread;
-typedef qemuMigrationIOThread *qemuMigrationIOThreadPtr;
-struct _qemuMigrationIOThread {
-    virThread thread;
+struct virMigrationBuffer {
+    size_t length;
+    size_t offset;
+    char *data;
+};
+
+typedef struct _qemuMigrationIO qemuMigrationIO;
+typedef qemuMigrationIO *qemuMigrationIOPtr;
+struct _qemuMigrationIO {
     virStreamPtr st;
     int sock;
     virError err;
-    int wakeupRecvFD;
-    int wakeupSendFD;
+    int srcQemuWatch;
+    //bool quit;
+    //virCond cond;
+    //virMutex lock;
+    struct virMigrationBuffer sourceToDestination;
+    struct virMigrationBuffer destinationToSource;
 };
 
-static void qemuMigrationIOFunc(void *arg)
+/*static void virMigrationFinish(qemuMigrationIOPtr io)
 {
-    qemuMigrationIOThreadPtr data = arg;
-    char *buffer = NULL;
-    struct pollfd fds[2];
-    int timeout = -1;
-    virErrorPtr err = NULL;
+    if (io->st) {
+        virStreamEventRemoveCallback(io->st);
+        virStreamFinish(io->st);
+        virStreamFree(io->st);
+        io->st = NULL;
+    }
+    VIR_FREE(io->sourceToDestination.data);
+    VIR_FREE(io->destinationToSource.data);
+    if (io->srcQemuWatch != -1)
+        virEventRemoveHandle(io->srcQemuWatch);
+    io->srcQemuWatch = -1;
+    VIR_FREE(io);
+}*/
 
-    VIR_DEBUG("Running migration tunnel; stream=%p, sock=%d",
-              data->st, data->sock);
+static void
+qemuMigrationEventOnStream(virStreamPtr st ATTRIBUTE_UNUSED, int events, void *opaque) {
+    qemuMigrationIOPtr data = opaque;
 
-    if (VIR_ALLOC_N(buffer, TUNNEL_SEND_BUF_SIZE) < 0)
-        goto abrt;
-
-    fds[0].fd = data->sock;
-    fds[1].fd = data->wakeupRecvFD;
-
-    for (;;) {
-        int ret;
-
-        fds[0].events = fds[1].events = POLLIN;
-        fds[0].revents = fds[1].revents = 0;
-
-        ret = poll(fds, ARRAY_CARDINALITY(fds), timeout);
-
-        if (ret < 0) {
-            if (errno == EAGAIN || errno == EINTR)
-                continue;
-            virReportSystemError(errno, "%s",
-                                 _("poll failed in migration tunnel"));
-            goto abrt;
+    if (events & VIR_STREAM_EVENT_READABLE) {
+        size_t avail = data->destinationToSource.length - data->destinationToSource.offset;
+        int got;
+        if (avail < TUNNEL_RECV_BUF_SIZE) {
+            if (VIR_REALLOC_N(data->destinationToSource.data, data->destinationToSource.length + TUNNEL_RECV_BUF_SIZE) < 0) {
+                //virMigrationShutdown(data);
+                VIR_WARN("dest->src buffer realocation failed");
+                return;
+            }
+            data->destinationToSource.length += TUNNEL_RECV_BUF_SIZE;
+            avail += TUNNEL_RECV_BUF_SIZE;
         }
 
-        if (ret == 0) {
-            /* We were asked to gracefully stop but reading would block. This
-             * can only happen if qemu told us migration finished but didn't
-             * close the migration fd. We handle this in the same way as EOF.
-             */
-            VIR_DEBUG("QEMU forgot to close migration fd");
-            break;
+        got = virStreamRecv(data->st, data->destinationToSource.data + data->destinationToSource.offset, avail);
+        if (got == -2)
+            return; /* We dont want to block */
+        if (got < 0) {
+            //virMigrationShutdown(data);
+            VIR_WARN("recv failed, got:%d", got);
+            return;
+        }
+        if (got == 0) {
+            //data->quit = true; 
+            //virCondSignal(&data->cond);
+            //VIR_WARN("EOF from stream");
+            //virMigrationFinish(data);
+            return; /* EOF */
+        }
+        data->destinationToSource.offset += got;
+        if (data->destinationToSource.offset)
+            virEventUpdateHandle(data->srcQemuWatch, VIR_EVENT_HANDLE_WRITABLE);
+    }
+    if (events & VIR_STREAM_EVENT_WRITABLE && data->sourceToDestination.offset) {
+        ssize_t done;
+        size_t avail;
+        done = virStreamSend(data->st, data->sourceToDestination.data, data->sourceToDestination.offset);
+        if (done == -2)
+            return; /* We dont want to block */
+        if (done < 0) {
+            //virMigrationShutdown(data);
+            VIR_WARN("send failed, done:%zu", done);
+            return;
         }
 
-        if (fds[1].revents & (POLLIN | POLLERR | POLLHUP)) {
-            char stop = 0;
+        memmove(data->sourceToDestination.data, data->sourceToDestination.data + done, data->sourceToDestination.offset - done);
+        data->sourceToDestination.offset -= done;
 
-            if (saferead(data->wakeupRecvFD, &stop, 1) != 1) {
-                virReportSystemError(errno, "%s",
-                                     _("failed to read from wakeup fd"));
-                goto abrt;
+        avail = data->sourceToDestination.length - data->sourceToDestination.offset;
+
+        if (avail > TUNNEL_SEND_BUF_SIZE) {
+            if ((VIR_REALLOC_N(data->sourceToDestination.data, data->sourceToDestination.offset + TUNNEL_SEND_BUF_SIZE) < 1)) {
+                //virMigrationShutdown(data);
+                VIR_WARN("src->dest buffer realocation failed");
+                return;
             }
-
-            VIR_DEBUG("Migration tunnel was asked to %s",
-                      stop ? "abort" : "finish");
-            if (stop) {
-                goto abrt;
-            } else {
-                timeout = 0;
-            }
-        }
-
-        if (fds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
-            int nbytes;
-
-            nbytes = saferead(data->sock, buffer, TUNNEL_SEND_BUF_SIZE);
-            if (nbytes > 0) {
-                if (virStreamSend(data->st, buffer, nbytes) < 0)
-                    goto error;
-            } else if (nbytes < 0) {
-                virReportSystemError(errno, "%s",
-                        _("tunnelled migration failed to read from qemu"));
-                goto abrt;
-            } else {
-                /* EOF; get out of here */
-                break;
-            }
+            data->sourceToDestination.length = data->sourceToDestination.offset + TUNNEL_SEND_BUF_SIZE;
         }
     }
-
-    if (virStreamFinish(data->st) < 0)
-        goto error;
-
-    VIR_FREE(buffer);
-
-    return;
-
- abrt:
-    err = virSaveLastError();
-    if (err && err->code == VIR_ERR_OK) {
-        virFreeError(err);
-        err = NULL;
+    if (!data->sourceToDestination.offset)
+        virStreamEventUpdateCallback(data->st, VIR_STREAM_EVENT_READABLE);
+    if (events & VIR_STREAM_EVENT_ERROR || events & VIR_STREAM_EVENT_HANGUP) {
+        //virMigrationShutdown(data);
+        VIR_WARN("stream error / hangup, events: %d", events);
+        return;
     }
-    virStreamAbort(data->st);
-    if (err) {
-        virSetError(err);
-        virFreeError(err);
-    }
-
- error:
-    virCopyLastError(&data->err);
-    virResetLastError();
-    VIR_FREE(buffer);
 }
 
+static void
+qemuMigrationEventOnFD(int watch ATTRIBUTE_UNUSED, int fd, int events, void *opaque) {
+    qemuMigrationIOPtr data = opaque;
+    size_t avail;
 
-static qemuMigrationIOThreadPtr
+    if (events & VIR_EVENT_HANDLE_READABLE) {
+        avail = data->sourceToDestination.length - data->sourceToDestination.offset;
+        int got;
+        if (avail < TUNNEL_SEND_BUF_SIZE) {
+            if (VIR_REALLOC_N(data->sourceToDestination.data, data->sourceToDestination.length + TUNNEL_SEND_BUF_SIZE) < 0) {
+                //virMigrationShutdown(data);
+                VIR_WARN("src->dest buffer reallocation failed");
+                return;
+            }
+            data->sourceToDestination.length += TUNNEL_SEND_BUF_SIZE;
+            avail += TUNNEL_SEND_BUF_SIZE;
+        }
+        got = read(fd, data->sourceToDestination.data + data->sourceToDestination.offset, avail);
+        if (got < 0) {
+            if (errno != EAGAIN) {
+                VIR_WARN("read failed, got: %d", got);
+                //virMigrationShutdown(data);
+            }
+            return;
+        }
+        if (got == 0) {
+            //data->quit = true;
+            //virCondSignal(&data->cond);
+            //VIR_WARN("EOF from FD");
+            //virMigrationFinish(data);
+            return; /* EOF */
+        }
+        data->sourceToDestination.offset += got;
+        if (data->sourceToDestination.offset)
+            virStreamEventUpdateCallback(data->st, VIR_STREAM_EVENT_READABLE | VIR_STREAM_EVENT_WRITABLE);
+    }
+
+    if (events & VIR_EVENT_HANDLE_WRITABLE && data->destinationToSource.offset) {
+        ssize_t done;
+        done = write(fd, data->destinationToSource.data, data->destinationToSource.offset);
+        if (done < 0) {
+            if (errno != EAGAIN) {
+                VIR_WARN("write failed, done: %zu", done);
+                //virMigrationShutdown(data);
+             }
+            return;
+        }
+        memmove(data->destinationToSource.data, data->destinationToSource.data + done, data->destinationToSource.offset - done);
+        data->destinationToSource.offset -= done;
+
+        avail = data->destinationToSource.length - data->destinationToSource.offset;
+        if (avail > TUNNEL_RECV_BUF_SIZE) {
+            ignore_value(VIR_REALLOC_N(data->destinationToSource.data, data->destinationToSource.offset + TUNNEL_RECV_BUF_SIZE));
+            data->destinationToSource.length = data->destinationToSource.offset + TUNNEL_RECV_BUF_SIZE;
+        }
+
+        if (!data->destinationToSource.offset)
+            virEventUpdateHandle(data->srcQemuWatch, VIR_EVENT_HANDLE_READABLE);
+    }
+
+    if (events & VIR_EVENT_HANDLE_ERROR || events & VIR_EVENT_HANDLE_HANGUP) {
+        //virMigrationShutdown(data);
+        VIR_WARN("handle error or hangup, events: %d", events);
+        return;
+    }
+}
+
+static qemuMigrationIOPtr
 qemuMigrationStartTunnel(virStreamPtr st,
                          int sock)
 {
-    qemuMigrationIOThreadPtr io = NULL;
-    int wakeupFD[2] = { -1, -1 };
-
-    if (pipe2(wakeupFD, O_CLOEXEC) < 0) {
-        virReportSystemError(errno, "%s",
-                             _("Unable to make pipe"));
-        goto error;
-    }
+    qemuMigrationIOPtr io = NULL;
 
     if (VIR_ALLOC(io) < 0)
         goto error;
 
     io->st = st;
     io->sock = sock;
-    io->wakeupRecvFD = wakeupFD[0];
-    io->wakeupSendFD = wakeupFD[1];
+    /*io->quit = false;
 
-    if (virThreadCreate(&io->thread, true,
-                        qemuMigrationIOFunc,
-                        io) < 0) {
-        virReportSystemError(errno, "%s",
-                             _("Unable to create migration thread"));
+    if (virCondInit(&io->cond) < 0 || virMutexInit(&io->lock) < 0)
         goto error;
-    }
 
+    virMutexLock(&io->lock);
+    */
+    io->srcQemuWatch = virEventAddHandle(sock, VIR_EVENT_HANDLE_READABLE, qemuMigrationEventOnFD, io, NULL);
+
+    virStreamEventAddCallback(st, VIR_STREAM_EVENT_READABLE, qemuMigrationEventOnStream, io, NULL);
     return io;
 
  error:
-    VIR_FORCE_CLOSE(wakeupFD[0]);
-    VIR_FORCE_CLOSE(wakeupFD[1]);
     VIR_FREE(io);
     return NULL;
 }
-
+/*
 static int
-qemuMigrationStopTunnel(qemuMigrationIOThreadPtr io, bool error)
+qemuMigrationStopTunnel(qemuMigrationIOPtr io, bool error)
 {
     int rv = -1;
-    char stop = error ? 1 : 0;
 
-    /* make sure the thread finishes its job and is joinable */
-    if (safewrite(io->wakeupSendFD, &stop, 1) != 1) {
-        virReportSystemError(errno, "%s",
-                             _("failed to wakeup migration tunnel"));
-        goto cleanup;
+    while (!io->quit) {
+        if (virCondWait(&io->cond, &io->lock) < 0) {
+            VIR_ERROR(_("unable to wait on migration condition"));
+        }
     }
+        
+    virMutexUnlock(&io->lock);
 
-    virThreadJoin(&io->thread);
-
-    /* Forward error from the IO thread, to this thread */
+  */  /* Forward error from the IO thread, to this thread */ /*
     if (io->err.code != VIR_ERR_OK) {
         if (error)
             rv = 0;
@@ -3588,15 +3639,16 @@ qemuMigrationStopTunnel(qemuMigrationIOThreadPtr io, bool error)
         goto cleanup;
     }
 
+    virStreamFinish(io->st);
+    virMigrationShutdown(io);
+
     rv = 0;
 
  cleanup:
-    VIR_FORCE_CLOSE(io->wakeupSendFD);
-    VIR_FORCE_CLOSE(io->wakeupRecvFD);
     VIR_FREE(io);
     return rv;
 }
-
+*/
 static int
 qemuMigrationConnect(virQEMUDriverPtr driver,
                      virDomainObjPtr vm,
@@ -3657,7 +3709,7 @@ qemuMigrationRun(virQEMUDriverPtr driver,
     unsigned int migrate_flags = QEMU_MONITOR_MIGRATE_BACKGROUND;
     qemuDomainObjPrivatePtr priv = vm->privateData;
     qemuMigrationCookiePtr mig = NULL;
-    qemuMigrationIOThreadPtr iothread = NULL;
+    qemuMigrationIOPtr iothread = NULL;
     int fd = -1;
     unsigned long migrate_speed = resource ? resource : priv->migMaxBandwidth;
     virErrorPtr orig_err = NULL;
@@ -3885,13 +3937,6 @@ qemuMigrationRun(virQEMUDriverPtr driver,
     /* cancel any outstanding NBD jobs */
     if (mig)
         qemuMigrationCancelDriveMirror(mig, driver, vm);
-
-    if (spec->fwdType != MIGRATION_FWD_DIRECT) {
-        if (iothread && qemuMigrationStopTunnel(iothread, ret < 0) < 0)
-            ret = -1;
-        VIR_FORCE_CLOSE(fd);
-    }
-
     if (priv->job.completed) {
         qemuDomainJobInfoUpdateTime(priv->job.completed);
         qemuDomainJobInfoUpdateDowntime(priv->job.completed);
@@ -4045,9 +4090,16 @@ static int doTunnelMigrate(virQEMUDriverPtr driver,
         spec.dest.fd.qemu = -1;
         spec.dest.fd.local = -1;
 
-        if (pipe2(fds, O_CLOEXEC) == 0) {
-            spec.dest.fd.qemu = fds[1];
-            spec.dest.fd.local = fds[0];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0) {
+            if (virSetBlocking(fds[0], false) < 0 ||
+                virSetBlocking(fds[1], false) < 0 ||
+                virSetCloseExec(fds[0]) < 0 ||
+                virSetCloseExec(fds[0]) < 0) {
+                virReportSystemError(errno, "%s", _("Unable to corectly setup sockets"));
+            } else {
+                spec.dest.fd.qemu = fds[1];
+                spec.dest.fd.local = fds[0];
+            }
         }
         if (spec.dest.fd.qemu == -1 ||
             virSecurityManagerSetImageFDLabel(driver->securityManager, vm->def,
@@ -4336,7 +4388,7 @@ doPeer2PeerMigrate3(virQEMUDriverPtr driver,
     cookieout = NULL;
     cookieoutlen = 0;
     if (flags & VIR_MIGRATE_TUNNELLED) {
-        if (!(st = virStreamNew(dconn, 0)))
+        if (!(st = virStreamNew(dconn, VIR_STREAM_NONBLOCK)))
             goto cleanup;
 
         qemuDomainObjEnterRemote(vm);

@@ -5435,7 +5435,7 @@ remoteDispatchDomainMigratePrepareTunnel3Params(virNetServerPtr server ATTRIBUTE
                                              args->flags) < 0)
         goto cleanup;
 
-    if (daemonAddClientStream(client, stream, false) < 0)
+    if (daemonAddClientStream(client, stream, true) < 0)
         goto cleanup;
 
     ret->cookie_out.cookie_out_val = cookieout;
